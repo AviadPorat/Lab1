@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bricks Strike Back</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d17; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #wrap { display: flex; align-items: center; justify-content: center; height: 100%; }
+  canvas { background: #11142a; border-radius: 10px; box-shadow: 0 0 50px #000a;
+    touch-action: none; display: block; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+(() => {
+"use strict";
+
+// ---------- Setup ----------
+const W = 800, H = 600, HUD = 44;
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H) * 0.98;
+  const dpr = window.devicePixelRatio || 1;
+  cv.style.width = W * s + "px";
+  cv.style.height = H * s + "px";
+  cv.width = Math.round(W * s * dpr);
+  cv.height = Math.round(H * s * dpr);
+  ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
+}
+addEventListener("resize", resize);
+resize();
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+let best = 0;
+try { best = +localStorage.getItem("bsb_best") || 0; } catch (e) {}
+
+// ---------- Sound (synthesized, no files) ----------
+const Sound = {
+  ctx: null, master: null, muted: false, last: {},
+  init() {
+    if (!this.ctx) {
+      try {
+        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = 0.5;
+        this.master.connect(this.ctx.destination);
+      } catch (e) { this.ctx = null; }
+    }
+    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+  },
+  tone(f, d, type = "square", v = 0.08, f2 = null, delay = 0) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f, t);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + d);
+    g.gain.setValueAtTime(v, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + d + 0.02);
+  },
+  noise(d, v = 0.2, freq = 800) {
+    const c = this.ctx, len = Math.floor(c.sampleRate * d);
+    const buf = c.createBuffer(1, len, c.sampleRate), data = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    src.buffer = buf; f.type = "lowpass"; f.frequency.value = freq; g.gain.value = v;
+    src.connect(f); f.connect(g); g.connect(this.master);
+    src.start();
+  },
+  play(name) {
+    if (this.muted || !this.ctx) return;
+    const now = this.ctx.currentTime;
+    if (this.last[name] && now - this.last[name] < 0.035) return;
+    this.last[name] = now;
+    const s = this;
+    switch (name) {
+      case "bounce": s.tone(440, 0.06, "square", 0.05); break;
+      case "hit": s.tone(rand(560, 680), 0.05, "square", 0.04); break;
+      case "break": s.tone(900, 0.12, "triangle", 0.08, 300); break;
+      case "shoot": s.tone(320, 0.08, "sawtooth", 0.02, 160); break;
+      case "laser": s.tone(1400, 0.06, "sawtooth", 0.02, 700); break;
+      case "launch": s.tone(520, 0.08, "triangle", 0.08, 780); break;
+      case "hurt": s.tone(220, 0.25, "sawtooth", 0.1, 60); s.noise(0.15, 0.12, 1200); break;
+      case "boom": s.noise(0.45, 0.25, 600); s.tone(120, 0.3, "sine", 0.15, 40); break;
+      case "bigboom": s.noise(1.2, 0.35, 500); s.tone(90, 1, "sine", 0.2, 30); break;
+      case "pickup": s.tone(660, 0.08, "triangle", 0.1); s.tone(990, 0.1, "triangle", 0.1, null, 0.08); break;
+      case "buy": s.tone(880, 0.07, "square", 0.06); s.tone(1320, 0.1, "square", 0.06, null, 0.07); break;
+      case "deny": s.tone(150, 0.15, "square", 0.07); break;
+      case "block": s.tone(1000, 0.1, "sine", 0.08, 1500); break;
+      case "bosshit": s.tone(160, 0.07, "square", 0.07, 110); break;
+      case "bossshoot": s.tone(240, 0.15, "sawtooth", 0.05, 90); break;
+      case "clear": [523, 659, 784, 1047].forEach((f, i) => s.tone(f, 0.15, "triangle", 0.09, null, i * 0.1)); break;
+      case "over": s.tone(400, 1.2, "sawtooth", 0.1, 50); break;
+      case "warn": s.tone(880, 0.2, "square", 0.05); s.tone(660, 0.2, "square", 0.05, null, 0.25); break;
+    }
+  },
+};
+
+// ---------- Data ----------
+const TYPES = {
+  basic:  { hp: 1, color: "#4dd0e1", score: 10, coins: 1, fire: [5, 10],  shot: "pellet" },
+  gunner: { hp: 2, color: "#ffb74d", score: 25, coins: 2, fire: [2.5, 5], shot: "aimed"  },
+  bomber: { hp: 3, color: "#ef5350", score: 40, coins: 3, fire: [5, 9],   shot: "bomb"   },
+  armor:  { hp: 5, color: "#9575cd", score: 60, coins: 4, fire: null,     shot: null     },
+};
+const CHAR = { b: "basic", g: "gunner", x: "bomber", a: "armor" };
+
+const PICKUPS = {
+  heal:   { color: "#66bb6a", label: "+" },
+  wide:   { color: "#42a5f5", label: "W" },
+  multi:  { color: "#ffee58", label: "M" },
+  shield: { color: "#26c6da", label: "S" },
+  laser:  { color: "#ff4081", label: "L" },
+};
+
+// Hand-designed layouts (10 columns). b=basic g=gunner x=bomber a=armor .=empty
+const LAYOUTS = [
+  { name: "First Contact", move: false, descend: false, map: [
+    "bbbbbbbbbb",
+    "bbbbbbbbbb",
+    "bbbgbbgbbb",
+    "bbbbbbbbbb"] },
+  { name: "Pyramid", move: false, descend: false, map: [
+    "....gg....",
+    "...bbbb...",
+    "..bbggbb..",
+    ".bbbbbbbb.",
+    "bbbxbbxbbb"] },
+  { name: "Fortress", move: true, descend: false, map: [
+    "a.a.a.a.a.",
+    "gbbbbbbbbg",
+    "b.xbbbbx.b",
+    "bbbbggbbbb",
+    "aaa....aaa"] },
+  { name: "Checkerboard", move: true, descend: false, map: [
+    "g.g.g.g.g.",
+    ".b.b.b.b.b",
+    "x.b.x.b.x.",
+    ".b.b.b.b.b",
+    "b.g.b.g.b.",
+    ".a.a.a.a.a"] },
+  { name: "Wings", move: false, descend: true, map: [
+    "gx......xg",
+    "bbb....bbb",
+    "bbbbaabbbb",
+    ".bbbggbbb.",
+    "..bbbbbb..",
+    "...xaax..."] },
+  { name: "The Wall", move: true, descend: true, map: [
+    "aaaaaaaaaa",
+    "gggggggggg",
+    "bbbbbbbbbb",
+    "xbxbxbxbxb",
+    "bbbbbbbbbb"] },
+  { name: "Diamond", move: true, descend: false, map: [
+    "....aa....",
+    "...bggb...",
+    "..bbxxbb..",
+    ".gbbaabbg.",
+    "..bbxxbb..",
+    "...bggb...",
+    "....aa...."] },
+  { name: "Gauntlet", move: true, descend: true, map: [
+    "xgxgxgxgxg",
+    "a.a.a.a.a.",
+    "bbbbbbbbbb",
+    ".g.g.g.g.g",
+    "bbbbbbbbbb",
+    "a.a.a.a.a."] },
+];
+const BOSS_MAP = ["", "", "", "", "b.g.bb.g.b"];
+
+// Shop
+const SHOP = [
+  { id: "repair", name: "Repair",          desc: "Restore 35 HP",          base: 6,  grow: 0.5, max: Infinity,
+    can: () => paddle.hp < paddle.maxHp, apply: () => { paddle.hp = Math.min(paddle.maxHp, paddle.hp + 35); } },
+  { id: "hull",   name: "Reinforced Hull", desc: "+20 max HP",             base: 14, grow: 0.6, max: 5,
+    apply: () => { paddle.maxHp += 20; paddle.hp += 20; } },
+  { id: "width",  name: "Wider Paddle",    desc: "+14 paddle width",       base: 12, grow: 0.6, max: 4, apply: () => {} },
+  { id: "power",  name: "Heavy Ball",      desc: "+1 ball damage",         base: 30, grow: 0.8, max: 2, apply: () => {} },
+  { id: "laser",  name: "Laser Cannons",   desc: "Start levels with lasers", base: 20, grow: 0.6, max: 3, apply: () => {} },
+  { id: "armor",  name: "Armor Plating",   desc: "-15% damage taken",      base: 18, grow: 0.7, max: 3, apply: () => {} },
+];
+const shopCost = it => Math.round(it.base * (1 + (up[it.id] || 0) * it.grow));
+const shopCard = i => ({ x: 50 + (i % 3) * 240, y: 160 + Math.floor(i / 3) * 150, w: 220, h: 130 });
+const shopBtn = { x: W / 2 - 130, y: 480, w: 260, h: 52 };
+
+// ---------- State ----------
+let state = "menu"; // menu | play | paused | clear | shop | over
+let paddle = null, balls = [], bricks = [], bullets = [], shots = [], particles = [], pickups = [], floaters = [];
+let boss = null, form = { t: 0, dy: 0, move: false, descend: false, rate: 0 };
+let score = 0, coins = 0, level = 1, up = {};
+let shake = 0, stateTimer = 0, flash = 0, banner = null;
+const keys = {};
+let pointerX = null;
+const mouse = { x: -1, y: -1 };
+
+const paddleBaseW = () => 110 + (up.width || 0) * 14;
+const ballDmg = () => 1 + (up.power || 0);
+const ballSpeed = () => 380 + Math.min(level, 12) * 22;
+const fireMul = () => Math.max(0.45, 1 - (level - 1) * 0.08);
+
+function newGame() {
+  score = 0; coins = 0; level = 1; up = {};
+  paddle = { x: W / 2, y: H - 36, w: 110, h: 14, hp: 100, maxHp: 100, inv: 0, wide: 0, shield: 0, laser: 0, laserCd: 0 };
+  startLevel();
+  state = "play";
+}
+
+function startLevel() {
+  bullets = []; shots = []; particles = []; pickups = []; floaters = [];
+  paddle.wide = 0; paddle.shield = 0;
+  paddle.laser = (up.laser || 0) * 4;
+  balls = [newBall()];
+  buildLevel();
+}
+
+function newBall() {
+  return { x: paddle.x, y: paddle.y - 20, vx: 0, vy: 0, r: 7, stuck: true, dead: false };
+}
+
+function buildLevel() {
+  bricks = []; boss = null;
+  form = { t: 0, dy: 0, move: false, descend: false, rate: 3 + level * 0.4 };
+  let map, name, loop = 0;
+  if (level % 5 === 0) {
+    map = BOSS_MAP;
+    name = "⚠ BOSS — THE WARDEN";
+    form.move = true;
+    const hp = 24 + level * 4;
+    boss = { x: W / 2 - 120, y: HUD + 30, w: 240, h: 56, hp, maxHp: hp, vx: 80 + level * 6,
+             atk: 2.5, pattern: 0, burst: 0, burstT: 0, hit: 0, t: 0 };
+    Sound.play("warn");
+  } else {
+    const n = level - Math.floor(level / 5) - 1;
+    const L = LAYOUTS[n % LAYOUTS.length];
+    loop = Math.floor(n / LAYOUTS.length);
+    map = L.map;
+    name = L.name + (loop ? " +" + loop : "");
+    form.move = L.move || loop > 0;
+    form.descend = L.descend || loop > 0;
+  }
+  const cols = 10, mx = 40, top = HUD + 30, gap = 6, bh = 22;
+  const bw = (W - mx * 2 - gap * (cols - 1)) / cols;
+  map.forEach((line, r) => {
+    for (let c = 0; c < cols; c++) {
+      let t = CHAR[line[c]];
+      if (!t) continue;
+      if (loop > 0 && t === "basic") {
+        const q = Math.random();
+        if (q < 0.12 * loop) t = "gunner"; else if (q < 0.2 * loop) t = "bomber";
+      }
+      const T = TYPES[t];
+      const x = mx + c * (bw + gap), y = top + r * (bh + gap);
+      bricks.push({ bx: x, by: y, x, y, w: bw, h: bh, row: r, type: t, hp: T.hp, maxHp: T.hp, hit: 0,
+        cd: T.fire ? rand(T.fire[0], T.fire[1]) * fireMul() + 2 : 0 });
+    }
+  });
+  banner = { title: "LEVEL " + level, sub: name, t: 2.4 };
+}
+
+// ---------- Effects ----------
+function burst(x, y, color, n = 12, spd = 200, size = 3) {
+  for (let i = 0; i < n && particles.length < 700; i++) {
+    const a = Math.random() * Math.PI * 2, s = rand(spd * 0.3, spd);
+    const life = rand(0.3, 0.7);
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, color, size: rand(size * 0.5, size) });
+  }
+}
+
+function floatText(x, y, text, color) {
+  floaters.push({ x, y, text, color, life: 1 });
+}
+
+function damage(n, src) {
+  if (state !== "play") return;
+  const unblockable = src === "ball" || src === "breach";
+  if (!unblockable && paddle.inv > 0) return;
+  if (paddle.shield > 0 && !unblockable) {
+    floatText(paddle.x, paddle.y - 30, "BLOCKED", "#26c6da");
+    burst(paddle.x, paddle.y - 10, "#26c6da", 10, 150);
+    Sound.play("block");
+    return;
+  }
+  n = Math.max(1, Math.round(n * (1 - 0.15 * (up.armor || 0))));
+  paddle.hp -= n;
+  paddle.inv = 0.35;
+  shake = Math.max(shake, n * 0.6);
+  flash = 0.25;
+  floatText(paddle.x, paddle.y - 30, "-" + n, "#ff5252");
+  burst(paddle.x, paddle.y, "#ff5252", 14, 220);
+  Sound.play("hurt");
+  if (paddle.hp <= 0) {
+    paddle.hp = 0;
+    burst(paddle.x, paddle.y, "#ffffff", 40, 400, 5);
+    burst(paddle.x, paddle.y, "#ff7043", 40, 300, 4);
+    shake = 20;
+    state = "over";
+    stateTimer = 0;
+    Sound.play("bigboom");
+    Sound.play("over");
+    if (score > best) { best = score; try { localStorage.setItem("bsb_best", best); } catch (e) {} }
+  }
+}
+
+// ---------- Actions ----------
+function launch() {
+  let any = false;
+  for (const b of balls) {
+    if (!b.stuck) continue;
+    const a = rand(-0.35, 0.35), s = ballSpeed();
+    b.vx = s * Math.sin(a); b.vy = -s * Math.cos(a); b.stuck = false;
+    any = true;
+  }
+  if (any) Sound.play("launch");
+}
+
+function spawnBullet(kind, x, y, vx, vy, color, dmg, r) {
+  bullets.push({ kind, x, y, vx, vy, color, dmg, r, t: 0 });
+}
+
+function fire(br) {
+  const T = TYPES[br.type];
+  const x = br.x + br.w / 2, y = br.y + br.h;
+  if (T.shot === "pellet") {
+    spawnBullet("pellet", x, y, 0, 220 + level * 12, T.color, 8, 4);
+  } else if (T.shot === "aimed") {
+    const dx = paddle.x - x, dy = paddle.y - y, d = Math.hypot(dx, dy) || 1, s = 270 + level * 12;
+    spawnBullet("aimed", x, y, dx / d * s, dy / d * s, T.color, 10, 4);
+  } else if (T.shot === "bomb") {
+    spawnBullet("bomb", x, y, 0, 140 + level * 6, T.color, 20, 9);
+  }
+  Sound.play("shoot");
+}
+
+function hitBrick(br, dmg) {
+  br.hp -= dmg;
+  br.hit = 0.12;
+  const T = TYPES[br.type];
+  burst(br.x + br.w / 2, br.y + br.h / 2, T.color, 6, 150, 2.5);
+  if (br.hp > 0) { Sound.play("hit"); return; }
+  score += T.score;
+  coins += T.coins;
+  shake = Math.max(shake, 3);
+  burst(br.x + br.w / 2, br.y + br.h / 2, T.color, 18, 260, 3.5);
+  floatText(br.x + br.w / 2, br.y, "+" + T.score, T.color);
+  Sound.play("break");
+  if (Math.random() < 0.13) {
+    const kinds = Object.keys(PICKUPS);
+    pickups.push({ x: br.x + br.w / 2, y: br.y + br.h / 2, vy: 120, type: kinds[(Math.random() * kinds.length) | 0] });
+  }
+}
+
+function hitBoss(dmg) {
+  boss.hp -= dmg;
+  boss.hit = 0.1;
+  Sound.play("bosshit");
+  if (boss.hp > 0) return;
+  const cx = boss.x + boss.w / 2, cy = boss.y + boss.h / 2;
+  for (let i = 0; i < 6; i++) {
+    burst(cx + rand(-100, 100), cy + rand(-25, 25), ["#ff4081", "#ffee58", "#ff7043", "#fff"][i % 4], 30, 380, 5);
+  }
+  const reward = 500 * (level / 5);
+  score += reward;
+  coins += 25 + level;
+  floatText(cx, cy, "WARDEN DESTROYED +" + reward, "#ffee58");
+  shake = 25;
+  flash = 0.2;
+  bullets = [];
+  Sound.play("bigboom");
+  boss = null;
+}
+
+function applyPickup(p) {
+  floatText(paddle.x, paddle.y - 30, p.type.toUpperCase(), PICKUPS[p.type].color);
+  burst(p.x, p.y, PICKUPS[p.type].color, 16, 200);
+  Sound.play("pickup");
+  if (p.type === "heal") paddle.hp = Math.min(paddle.maxHp, paddle.hp + 25);
+  else if (p.type === "wide") paddle.wide = 10;
+  else if (p.type === "shield") paddle.shield = 8;
+  else if (p.type === "laser") paddle.laser = Math.max(paddle.laser, 0) + 8;
+  else if (p.type === "multi") {
+    launch();
+    const extra = [];
+    for (const b of balls) {
+      for (const a of [-0.4, 0.4]) {
+        if (balls.length + extra.length >= 8) break;
+        const c = Math.cos(a), s = Math.sin(a);
+        extra.push({ ...b, vx: b.vx * c - b.vy * s, vy: b.vx * s + b.vy * c });
+      }
+    }
+    balls.push(...extra);
+  }
+}
+
+function buy(i) {
+  const it = SHOP[i];
+  if (!it) return;
+  const lv = up[it.id] || 0, cost = shopCost(it);
+  if (lv >= it.max || coins < cost || (it.can && !it.can())) { Sound.play("deny"); return; }
+  coins -= cost;
+  up[it.id] = lv + 1;
+  it.apply();
+  const c = shopCard(i);
+  burst(c.x + c.w / 2, c.y + c.h / 2, "#ffee58", 20, 220);
+  Sound.play("buy");
+}
+
+function leaveShop() {
+  level++;
+  startLevel();
+  state = "play";
+}
+
+// ---------- Update ----------
+// Circle vs rect: on contact, reflect the ball, push it out and return true
+function ballRect(b, x, y, w, h) {
+  const cx = clamp(b.x, x, x + w), cy = clamp(b.y, y, y + h);
+  const dx = b.x - cx, dy = b.y - cy;
+  if (dx * dx + dy * dy > b.r * b.r) return false;
+  const ox = Math.min(b.x + b.r - x, x + w - (b.x - b.r));
+  const oy = Math.min(b.y + b.r - y, y + h - (b.y - b.r));
+  if (ox < oy) {
+    if (b.x < x + w / 2) { b.vx = -Math.abs(b.vx); b.x = x - b.r; }
+    else { b.vx = Math.abs(b.vx); b.x = x + w + b.r; }
+  } else {
+    if (b.y < y + h / 2) { b.vy = -Math.abs(b.vy); b.y = y - b.r; }
+    else { b.vy = Math.abs(b.vy); b.y = y + h + b.r; }
+  }
+  return true;
+}
+
+function moveBall(b, dt) {
+  b.x += b.vx * dt; b.y += b.vy * dt;
+  if (b.x < b.r) { b.x = b.r; b.vx = Math.abs(b.vx); }
+  if (b.x > W - b.r) { b.x = W - b.r; b.vx = -Math.abs(b.vx); }
+  if (b.y < HUD + b.r) { b.y = HUD + b.r; b.vy = Math.abs(b.vy); }
+  if (b.y > H + 20) { b.dead = true; return; }
+
+  // Paddle
+  const p = paddle, px = p.x - p.w / 2, py = p.y - p.h / 2;
+  if (b.vy > 0 && b.y + b.r >= py && b.y - b.r <= py + p.h && b.x >= px - b.r && b.x <= px + p.w + b.r) {
+    const rel = clamp((b.x - p.x) / (p.w / 2), -1, 1);
+    const ang = rel * 1.05, s = ballSpeed();
+    b.vx = s * Math.sin(ang); b.vy = -s * Math.cos(ang);
+    b.y = py - b.r;
+    burst(b.x, py, "#ffffff", 5, 120, 2);
+    Sound.play("bounce");
+  }
+
+  // Boss
+  if (boss && ballRect(b, boss.x, boss.y, boss.w, boss.h)) {
+    hitBoss(ballDmg());
+    burst(b.x, b.y, "#ff4081", 8, 180, 3);
+  }
+
+  // Bricks
+  for (const br of bricks) {
+    if (br.hp > 0 && ballRect(b, br.x, br.y, br.w, br.h)) { hitBrick(br, ballDmg()); break; }
+  }
+
+  // Ball can pop bombs mid-air
+  for (const bl of bullets) {
+    if (bl.kind !== "bomb" || bl.dead) continue;
+    if (Math.hypot(bl.x - b.x, bl.y - b.y) < bl.r + b.r) {
+      bl.dead = true;
+      score += 15; coins += 1;
+      floatText(bl.x, bl.y, "+15", "#ffab91");
+      burst(bl.x, bl.y, "#ff7043", 20, 250, 4);
+      Sound.play("boom");
+    }
+  }
+
+  // Avoid near-horizontal loops
+  const s = Math.hypot(b.vx, b.vy), minVy = s * 0.25;
+  if (s > 0 && Math.abs(b.vy) < minVy) {
+    b.vy = (b.vy < 0 ? -1 : 1) * minVy;
+    b.vx = Math.sign(b.vx || 1) * Math.sqrt(s * s - minVy * minVy);
+  }
+}
+
+function updateFormation(dt) {
+  form.t += dt;
+  if (form.descend) form.dy += form.rate * dt;
+  let bottom = 0;
+  for (const br of bricks) {
+    const off = form.move ? Math.sin(form.t * 0.9 + br.row * 1.3) * 28 : 0;
+    br.x = br.bx + off;
+    br.y = br.by + form.dy;
+    bottom = Math.max(bottom, br.y + br.h);
+  }
+  if (form.descend && bottom > paddle.y - 90) {
+    floatText(W / 2, paddle.y - 120, "BREACH!", "#ff5252");
+    damage(20, "breach");
+    form.dy -= 90;
+    shake = Math.max(shake, 10);
+    Sound.play("boom");
+  }
+}
+
+function updateBoss(dt) {
+  const b = boss;
+  b.t += dt;
+  b.hit = Math.max(0, b.hit - dt);
+  b.x += b.vx * dt;
+  if (b.x < 20) { b.x = 20; b.vx = Math.abs(b.vx); }
+  if (b.x > W - 20 - b.w) { b.x = W - 20 - b.w; b.vx = -Math.abs(b.vx); }
+  const rage = b.hp < b.maxHp / 2;
+  const cx = b.x + b.w / 2, by = b.y + b.h;
+  b.atk -= dt;
+  if (b.atk <= 0) {
+    const pattern = b.pattern++ % 3;
+    if (pattern === 0) {
+      const n = rage ? 7 : 5;
+      for (let i = 0; i < n; i++) {
+        const a = (i / (n - 1) - 0.5) * 1.1, s = 230 + level * 4;
+        spawnBullet("pellet", cx, by, Math.sin(a) * s, Math.cos(a) * s, "#ff4081", 9, 5);
+      }
+    } else if (pattern === 1) {
+      b.burst = rage ? 5 : 3; b.burstT = 0;
+    } else {
+      spawnBullet("bomb", b.x + 30, by, 0, 150, "#ef5350", 20, 9);
+      spawnBullet("bomb", b.x + b.w - 30, by, 0, 150, "#ef5350", 20, 9);
+      if (rage) spawnBullet("bomb", cx, by, 0, 190, "#ef5350", 20, 9);
+    }
+    Sound.play("bossshoot");
+    b.atk = (rage ? 1.4 : 2.0) * Math.max(0.6, 1 - (level - 5) * 0.04);
+  }
+  if (b.burst > 0) {
+    b.burstT -= dt;
+    if (b.burstT <= 0) {
+      const dx = paddle.x - cx, dy = paddle.y - by, d = Math.hypot(dx, dy) || 1, s = 320;
+      spawnBullet("aimed", cx, by, dx / d * s, dy / d * s, "#ff4081", 10, 4);
+      Sound.play("shoot");
+      b.burst--; b.burstT = 0.13;
+    }
+  }
+}
+
+function update(dt) {
+  // Effects keep animating in every state
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.96; p.vy *= 0.96; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+  for (const f of floaters) { f.y -= 40 * dt; f.life -= dt; }
+  floaters = floaters.filter(f => f.life > 0);
+  shake = Math.max(0, shake - dt * 30);
+  flash = Math.max(0, flash - dt);
+  stateTimer += dt;
+
+  if (state === "clear" && stateTimer > 1.6) { state = "shop"; up.repair = 0; }
+  if (state !== "play") return;
+
+  if (banner) { banner.t -= dt; if (banner.t <= 0) banner = null; }
+
+  // Paddle
+  const spd = 720;
+  if (keys.arrowleft || keys.a) { paddle.x -= spd * dt; pointerX = null; }
+  if (keys.arrowright || keys.d) { paddle.x += spd * dt; pointerX = null; }
+  if (pointerX !== null) paddle.x += (pointerX - paddle.x) * Math.min(1, dt * 25);
+  const targetW = paddleBaseW() + (paddle.wide > 0 ? 60 : 0);
+  paddle.w += (targetW - paddle.w) * Math.min(1, dt * 8);
+  paddle.x = clamp(paddle.x, paddle.w / 2, W - paddle.w / 2);
+  paddle.inv = Math.max(0, paddle.inv - dt);
+  paddle.wide = Math.max(0, paddle.wide - dt);
+  paddle.shield = Math.max(0, paddle.shield - dt);
+
+  // Lasers
+  if (paddle.laser > 0) {
+    paddle.laser -= dt;
+    paddle.laserCd -= dt;
+    if (paddle.laserCd <= 0) {
+      paddle.laserCd = 0.22;
+      shots.push({ x: paddle.x - paddle.w / 2 + 8, y: paddle.y - 10 });
+      shots.push({ x: paddle.x + paddle.w / 2 - 8, y: paddle.y - 10 });
+      Sound.play("laser");
+    }
+  }
+  for (const s of shots) {
+    s.y -= 700 * dt;
+    if (s.y < HUD) { s.dead = true; continue; }
+    if (boss && s.x > boss.x && s.x < boss.x + boss.w && s.y > boss.y && s.y < boss.y + boss.h) {
+      s.dead = true; hitBoss(1); continue;
+    }
+    for (const br of bricks) {
+      if (br.hp > 0 && s.x > br.x && s.x < br.x + br.w && s.y > br.y && s.y < br.y + br.h) {
+        s.dead = true; hitBrick(br, 1); break;
+      }
+    }
+  }
+  shots = shots.filter(s => !s.dead);
+
+  updateFormation(dt);
+  if (state !== "play") return;
+  if (boss) updateBoss(dt);
+
+  // Balls
+  for (const b of balls) {
+    if (b.stuck) { b.x = paddle.x; b.y = paddle.y - paddle.h / 2 - b.r - 1; continue; }
+    const steps = Math.max(1, Math.ceil(Math.hypot(b.vx, b.vy) * dt / 4));
+    for (let i = 0; i < steps && !b.dead; i++) moveBall(b, dt / steps);
+  }
+  balls = balls.filter(b => !b.dead);
+  bricks = bricks.filter(br => br.hp > 0);
+  if (balls.length === 0) {
+    floatText(paddle.x, paddle.y - 50, "BALL LOST", "#ff5252");
+    damage(20, "ball");
+    if (state === "play") balls = [newBall()];
+  }
+
+  // Bricks shoot back
+  const maxBullets = (boss ? 30 : 4) + level * 2;
+  for (const br of bricks) {
+    const T = TYPES[br.type];
+    br.hit = Math.max(0, br.hit - dt);
+    if (!T.fire) continue;
+    br.cd -= dt;
+    if (br.cd <= 0) {
+      if (bullets.length < maxBullets) fire(br);
+      br.cd = rand(T.fire[0], T.fire[1]) * fireMul();
+    }
+  }
+
+  // Enemy bullets
+  const p = paddle, px = p.x - p.w / 2, py = p.y - p.h / 2;
+  for (const bl of bullets) {
+    if (bl.dead) continue;
+    bl.x += bl.vx * dt; bl.y += bl.vy * dt; bl.t += dt;
+    if (bl.kind === "bomb") {
+      if (bl.y >= p.y) {
+        bl.dead = true;
+        burst(bl.x, bl.y, "#ff7043", 30, 300, 4);
+        burst(bl.x, bl.y, "#ffee58", 15, 200, 3);
+        shake = Math.max(shake, 6);
+        Sound.play("boom");
+        if (Math.abs(bl.x - p.x) < p.w / 2 + 55) damage(bl.dmg, "bomb");
+      }
+      continue;
+    }
+    const cx = clamp(bl.x, px, px + p.w), cy = clamp(bl.y, py, py + p.h);
+    if ((bl.x - cx) ** 2 + (bl.y - cy) ** 2 <= bl.r * bl.r) {
+      bl.dead = true;
+      damage(bl.dmg, bl.kind);
+    } else if (bl.y > H + 20 || bl.x < -20 || bl.x > W + 20) bl.dead = true;
+  }
+  bullets = bullets.filter(b => !b.dead);
+
+  // Pickups
+  for (const pk of pickups) {
+    pk.y += pk.vy * dt;
+    if (pk.y + 10 >= py && pk.y - 10 <= py + p.h && Math.abs(pk.x - p.x) < p.w / 2 + 10) {
+      pk.dead = true; applyPickup(pk);
+    } else if (pk.y > H + 20) pk.dead = true;
+  }
+  pickups = pickups.filter(pk => !pk.dead);
+
+  if (state === "play" && bricks.length === 0 && !boss) {
+    state = "clear"; stateTimer = 0;
+    bullets = []; shots = [];
+    score += 100 * level;
+    coins += 5 + level;
+    paddle.hp = Math.min(paddle.maxHp, paddle.hp + 10);
+    Sound.play("clear");
+  }
+}
+
+// ---------- Draw ----------
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function text(str, x, y, font, color, align = "center") {
+  ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = "middle";
+  ctx.fillText(str, x, y);
+}
+
+function drawBrick(br) {
+  const T = TYPES[br.type];
+  const warn = T.fire && br.cd < 0.5 && Math.floor(br.cd * 16) % 2 === 0;
+  ctx.globalAlpha = 0.45 + 0.55 * (br.hp / br.maxHp);
+  ctx.fillStyle = br.hit > 0 || warn ? "#ffffff" : T.color;
+  rr(br.x, br.y, br.w, br.h, 4);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  ctx.fillRect(br.x + 2, br.y + br.h - 5, br.w - 4, 3);
+  const cx = br.x + br.w / 2, cy = br.y + br.h / 2;
+  ctx.fillStyle = "#11142a";
+  if (br.type === "gunner") ctx.fillRect(cx - 3, br.y + br.h - 2, 6, 6);
+  else if (br.type === "bomber") { ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI * 2); ctx.fill(); }
+  else if (br.type === "armor") text(br.hp, cx, cy, "bold 12px system-ui", "#11142a");
+}
+
+function drawBoss() {
+  const b = boss, rage = b.hp < b.maxHp / 2;
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
+  g.addColorStop(0, rage ? "#b71c4a" : "#6a1b9a");
+  g.addColorStop(1, rage ? "#4a0a1e" : "#2a0a40");
+  ctx.fillStyle = b.hit > 0 ? "#ffffff" : g;
+  ctx.shadowColor = rage ? "#ff1744" : "#ab47bc"; ctx.shadowBlur = 20;
+  rr(b.x, b.y, b.w, b.h, 12); ctx.fill();
+  ctx.shadowBlur = 0;
+  // Plates and cannons
+  ctx.fillStyle = "rgba(255,255,255,0.08)";
+  for (let i = 0; i < 4; i++) ctx.fillRect(b.x + 14 + i * 58, b.y + 8, 40, 6);
+  ctx.fillStyle = "#1a0826";
+  ctx.fillRect(b.x + 24, b.y + b.h - 2, 12, 10);
+  ctx.fillRect(b.x + b.w - 36, b.y + b.h - 2, 12, 10);
+  ctx.fillRect(cx - 7, b.y + b.h - 2, 14, 12);
+  // Eye tracks the paddle and glows before attacking
+  const charging = b.atk < 0.4;
+  ctx.fillStyle = charging ? "#ff1744" : "#f3e5f5";
+  ctx.beginPath(); ctx.arc(cx, cy, 16, 0, Math.PI * 2); ctx.fill();
+  const a = Math.atan2(paddle.y - cy, paddle.x - cx);
+  ctx.fillStyle = "#12001f";
+  ctx.beginPath(); ctx.arc(cx + Math.cos(a) * 7, cy + Math.sin(a) * 7, 7, 0, Math.PI * 2); ctx.fill();
+
+  // Boss HP bar
+  const bw = W - 80, bx = 40, by = HUD + 8;
+  ctx.fillStyle = "#2a2f55"; rr(bx, by, bw, 10, 4); ctx.fill();
+  ctx.fillStyle = rage ? "#ff1744" : "#ab47bc";
+  rr(bx, by, bw * Math.max(0, b.hp / b.maxHp), 10, 4); ctx.fill();
+  text("THE WARDEN", W / 2, by + 5, "bold 9px system-ui", "#fff");
+}
+
+function drawHUD() {
+  ctx.fillStyle = "#0d1022";
+  ctx.fillRect(0, 0, W, HUD);
+  ctx.fillStyle = "#2a2f55";
+  ctx.fillRect(0, HUD - 2, W, 2);
+  text("SCORE " + score, 16, HUD / 2, "bold 16px system-ui", "#e8ecff", "left");
+  text("LVL " + level, 160, HUD / 2, "bold 16px system-ui", "#e8ecff", "left");
+  text("◆ " + coins, 230, HUD / 2, "bold 16px system-ui", "#ffee58", "left");
+  text("BEST " + best, 310, HUD / 2, "bold 16px system-ui", "#8890c0", "left");
+  text(Sound.muted ? "🔇" : "🔊", W - 285, HUD / 2, "15px system-ui", "#8890c0");
+
+  const bx = W - 260, bw = 240, bh = 16, by = HUD / 2 - bh / 2;
+  const ratio = paddle ? paddle.hp / paddle.maxHp : 1;
+  ctx.fillStyle = "#2a2f55"; rr(bx, by, bw, bh, 5); ctx.fill();
+  ctx.fillStyle = ratio > 0.5 ? "#66bb6a" : ratio > 0.25 ? "#ffb74d" : "#ef5350";
+  if (ratio > 0) { rr(bx, by, bw * ratio, bh, 5); ctx.fill(); }
+  text("HP " + Math.ceil(paddle ? paddle.hp : 100) + " / " + (paddle ? paddle.maxHp : 100),
+       bx + bw / 2, HUD / 2 + 1, "bold 12px system-ui", "#fff");
+}
+
+function overlay(title, sub, color = "#e8ecff") {
+  ctx.fillStyle = "rgba(8,10,22,0.72)";
+  ctx.fillRect(0, 0, W, H);
+  text(title, W / 2, H / 2 - 40, "bold 52px system-ui", color);
+  sub.split("\n").forEach((line, i) => text(line, W / 2, H / 2 + 20 + i * 28, "18px system-ui", "#b8bfe8"));
+}
+
+const inside = (r, x, y) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+
+function drawShop() {
+  ctx.fillStyle = "rgba(8,10,22,0.93)";
+  ctx.fillRect(0, 0, W, H);
+  text("WORKSHOP", W / 2, 80, "bold 40px system-ui", "#ffee58");
+  text("Level " + level + " cleared — spend your scrap   ◆ " + coins, W / 2, 118, "17px system-ui", "#b8bfe8");
+  SHOP.forEach((it, i) => {
+    const c = shopCard(i), lv = up[it.id] || 0, cost = shopCost(it);
+    const maxed = lv >= it.max, usable = !it.can || it.can();
+    const ok = !maxed && usable && coins >= cost;
+    const hover = inside(c, mouse.x, mouse.y);
+    ctx.fillStyle = hover && ok ? "#232a55" : "#181c3a";
+    rr(c.x, c.y, c.w, c.h, 10); ctx.fill();
+    ctx.strokeStyle = ok ? "#ffee58" : "#2f355f"; ctx.lineWidth = hover && ok ? 2.5 : 1.5;
+    ctx.stroke();
+    const dim = ok ? 1 : 0.5;
+    ctx.globalAlpha = dim;
+    text("[" + (i + 1) + "]", c.x + 12, c.y + 18, "12px system-ui", "#8890c0", "left");
+    text(it.name, c.x + c.w / 2, c.y + 42, "bold 18px system-ui", "#e8ecff");
+    text(it.desc, c.x + c.w / 2, c.y + 68, "13px system-ui", "#b8bfe8");
+    if (it.max !== Infinity) {
+      for (let k = 0; k < it.max; k++) {
+        ctx.fillStyle = k < lv ? "#ffee58" : "#2f355f";
+        ctx.fillRect(c.x + c.w / 2 - it.max * 9 + k * 18 + 2, c.y + 86, 14, 6);
+      }
+    }
+    text(maxed ? "MAXED" : !usable ? "FULL HP" : "◆ " + cost, c.x + c.w / 2, c.y + 112,
+         "bold 16px system-ui", maxed ? "#66bb6a" : coins >= cost ? "#ffee58" : "#ef5350");
+    ctx.globalAlpha = 1;
+  });
+  const hb = inside(shopBtn, mouse.x, mouse.y);
+  ctx.fillStyle = hb ? "#43a047" : "#2e7d32";
+  rr(shopBtn.x, shopBtn.y, shopBtn.w, shopBtn.h, 10); ctx.fill();
+  text("NEXT LEVEL ▶", W / 2, shopBtn.y + shopBtn.h / 2, "bold 20px system-ui", "#fff");
+  text("Enter to continue" + ((level + 1) % 5 === 0 ? "   ·   ⚠ A boss is coming" : ""),
+       W / 2, shopBtn.y + 80, "14px system-ui", (level + 1) % 5 === 0 ? "#ff5252" : "#8890c0");
+}
+
+function draw() {
+  cv.style.cursor = state === "play" ? "none" : "default";
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+  if (shake > 0) ctx.translate(rand(-shake, shake), rand(-shake, shake));
+
+  // Background grid
+  ctx.fillStyle = "#11142a"; ctx.fillRect(-20, -20, W + 40, H + 40);
+  ctx.strokeStyle = "#171b38"; ctx.lineWidth = 1;
+  for (let x = 0; x <= W; x += 40) { ctx.beginPath(); ctx.moveTo(x, HUD); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = HUD; y <= H; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  if (paddle) {
+    // Danger line for descending formations
+    if (form.descend && bricks.length) {
+      ctx.strokeStyle = "rgba(255,82,82,0.3)"; ctx.setLineDash([8, 8]);
+      ctx.beginPath(); ctx.moveTo(0, paddle.y - 90); ctx.lineTo(W, paddle.y - 90); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    bricks.forEach(drawBrick);
+    if (boss) drawBoss();
+
+    for (const pk of pickups) {
+      const P = PICKUPS[pk.type];
+      ctx.fillStyle = P.color;
+      ctx.beginPath(); ctx.arc(pk.x, pk.y, 11, 0, Math.PI * 2); ctx.fill();
+      text(P.label, pk.x, pk.y + 1, "bold 13px system-ui", "#11142a");
+    }
+
+    // Player lasers
+    ctx.fillStyle = "#ff4081"; ctx.shadowColor = "#ff4081"; ctx.shadowBlur = 8;
+    for (const s of shots) ctx.fillRect(s.x - 1.5, s.y - 8, 3, 14);
+    ctx.shadowBlur = 0;
+
+    // Enemy bullets
+    for (const bl of bullets) {
+      ctx.fillStyle = bl.color;
+      ctx.shadowColor = bl.color; ctx.shadowBlur = 10;
+      if (bl.kind === "bomb") {
+        const pulse = 1 + Math.sin(bl.t * 14) * 0.15;
+        ctx.beginPath(); ctx.arc(bl.x, bl.y, bl.r * pulse, 0, Math.PI * 2); ctx.fill();
+        ctx.shadowBlur = 0; ctx.fillStyle = "#ffee58";
+        ctx.beginPath(); ctx.arc(bl.x, bl.y, 3, 0, Math.PI * 2); ctx.fill();
+      } else if (bl.kind === "aimed") {
+        ctx.save(); ctx.translate(bl.x, bl.y); ctx.rotate(Math.atan2(bl.vy, bl.vx));
+        ctx.fillRect(-8, -2.5, 16, 5); ctx.restore();
+      } else {
+        ctx.beginPath(); ctx.arc(bl.x, bl.y, bl.r, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.shadowBlur = 0;
+    }
+
+    // Paddle
+    if (state !== "over") {
+      const p = paddle;
+      const blink = p.inv > 0 && Math.floor(p.inv * 20) % 2 === 0;
+      if (!blink) {
+        const g = ctx.createLinearGradient(0, p.y - p.h / 2, 0, p.y + p.h / 2);
+        g.addColorStop(0, "#e8ecff"); g.addColorStop(1, "#7f8bd6");
+        ctx.fillStyle = g;
+        rr(p.x - p.w / 2, p.y - p.h / 2, p.w, p.h, 7); ctx.fill();
+        if (p.laser > 0) {
+          ctx.fillStyle = "#ff4081";
+          ctx.fillRect(p.x - p.w / 2 + 5, p.y - p.h / 2 - 7, 6, 9);
+          ctx.fillRect(p.x + p.w / 2 - 11, p.y - p.h / 2 - 7, 6, 9);
+        }
+      }
+      if (p.shield > 0) {
+        ctx.strokeStyle = `rgba(38,198,218,${p.shield < 2 ? 0.3 + 0.5 * (Math.sin(p.shield * 20) > 0) : 0.8})`;
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.ellipse(p.x, p.y, p.w / 2 + 14, 24, 0, Math.PI, 0); ctx.stroke();
+      }
+    }
+
+    for (const b of balls) {
+      ctx.fillStyle = ballDmg() > 1 ? "#ffd54f" : "#fff";
+      ctx.shadowColor = "#9fd8ff"; ctx.shadowBlur = 14;
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r + (ballDmg() - 1), 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  for (const p of particles) {
+    ctx.globalAlpha = p.life / p.max;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  for (const f of floaters) {
+    ctx.globalAlpha = Math.max(0, f.life);
+    text(f.text, f.x, f.y, "bold 15px system-ui", f.color);
+  }
+  ctx.globalAlpha = 1;
+
+  if (flash > 0) { ctx.fillStyle = `rgba(255,40,40,${flash * 0.5})`; ctx.fillRect(-20, -20, W + 40, H + 40); }
+  ctx.restore();
+
+  drawHUD();
+
+  if (state === "play") {
+    if (balls.some(b => b.stuck)) text("Click / Space to launch", W / 2, H - 80, "16px system-ui", "#8890c0");
+    if (banner) {
+      ctx.globalAlpha = Math.min(1, banner.t);
+      text(banner.title, W / 2, H / 2 + 20, "bold 44px system-ui", boss ? "#ff4081" : "#e8ecff");
+      text(banner.sub, W / 2, H / 2 + 62, "bold 20px system-ui", boss ? "#ff8a80" : "#8890c0");
+      ctx.globalAlpha = 1;
+    }
+    text("P pause · M mute", W - 10, H - 10, "11px system-ui", "#3b4170", "right");
+  }
+
+  if (state === "menu") overlay("BRICKS STRIKE BACK",
+    "The bricks shoot back. Survive and break them all.\nMove: mouse / touch / ← →    Launch: click / Space\nP pause   ·   M mute   ·   Boss every 5 levels\n\nClick or press Space to start", "#ffb74d");
+  else if (state === "paused") overlay("PAUSED", "Press P to resume");
+  else if (state === "clear") overlay("LEVEL " + level + " CLEAR", "+" + 100 * level + " bonus   ·   ◆ +" + (5 + level) + "   ·   +10 HP", "#66bb6a");
+  else if (state === "shop") drawShop();
+  else if (state === "over" && stateTimer > 0.8) overlay("DESTROYED", "Reached level " + level + "   ·   Score " + score + "   ·   Best " + best + "\n\nClick or press Space to retry", "#ef5350");
+}
+
+// ---------- Input ----------
+function primaryAction() {
+  Sound.init();
+  if (state === "menu") newGame();
+  else if (state === "over" && stateTimer > 0.8) newGame();
+  else if (state === "play") launch();
+}
+
+addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  if (k === " " || k === "arrowleft" || k === "arrowright") e.preventDefault();
+  Sound.init();
+  if (state === "shop") {
+    if (k >= "1" && k <= "6") buy(+k - 1);
+    if (k === "enter" || (k === " " && !e.repeat)) leaveShop();
+    return;
+  }
+  if (k === " " && !e.repeat) primaryAction();
+  if (k === "m") Sound.muted = !Sound.muted;
+  if (k === "p") {
+    if (state === "play") state = "paused";
+    else if (state === "paused") state = "play";
+  }
+});
+addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+addEventListener("blur", () => { for (const k in keys) keys[k] = false; if (state === "play") state = "paused"; });
+
+function toGame(e) {
+  const r = cv.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) / r.width * W;
+  mouse.y = (e.clientY - r.top) / r.height * H;
+}
+cv.addEventListener("pointermove", e => { toGame(e); pointerX = mouse.x; });
+cv.addEventListener("pointerdown", e => {
+  toGame(e);
+  Sound.init();
+  if (state === "shop") {
+    SHOP.forEach((_, i) => { if (inside(shopCard(i), mouse.x, mouse.y)) buy(i); });
+    if (inside(shopBtn, mouse.x, mouse.y)) leaveShop();
+    return;
+  }
+  if (state === "paused") { state = "play"; return; }
+  pointerX = mouse.x;
+  primaryAction();
+});
+
+// ---------- Loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(1 / 30, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
